@@ -286,7 +286,7 @@ fn knn_search(nodes: &[Node], query: &[f32; 14]) -> usize {
             }
 
             let sqrt_d = d.sqrt();
-            let r = node.radius;
+            let r = node.radius.sqrt(); // radius stored as dist_sq → take sqrt for euclidean
             let dl = (sqrt_d - r).max(0.0);
             let dr = (r - sqrt_d).max(0.0);
             let can_left  = node.left  != NULL && dl * dl < worst_best;
@@ -338,7 +338,7 @@ async fn fraud_score_handler(
         return json_response(RESPONSES[0]);
     }
 
-    let query = vectorize(&req);
+    let query = vectorize(&req).map(|x| (x * 10000.0).round() / 10000.0);
     let fraud_count = knn_search(state.nodes_slice(), &query);
     json_response(RESPONSES[fraud_count])
 }
