@@ -7,10 +7,15 @@ use axum::{
     Router,
 };
 use bytemuck::{Pod, Zeroable};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
 use memmap2::Mmap;
 use std::cell::RefCell;
 use std::fs::File;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use tower::ServiceExt;
 
 // ─── VP-Tree node (must match preprocess.rs exactly) ─────────────────────────
 
@@ -379,9 +384,38 @@ async fn main() {
         .route("/fraud-score", post(fraud_score_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+    // TCP :8080 — apenas para o healthcheck do docker-compose
+    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await
-        .expect("bind failed");
+        .expect("tcp bind failed");
+    let tcp_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(tcp_listener, tcp_app).await.expect("tcp serve failed");
+    });
 
-    axum::serve(listener, app).await.expect("serve failed");
+    // Unix socket — tráfego real do HAProxy (sem overhead de bridge TCP)
+    let sock_path = std::env::var("SOCKET_PATH")
+        .unwrap_or_else(|_| "/tmp/api.sock".to_string());
+    let _ = std::fs::remove_file(&sock_path);
+    let unix_listener = tokio::net::UnixListener::bind(&sock_path)
+        .expect("unix bind failed");
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o777))
+        .expect("set socket permissions failed");
+    eprintln!("Listening on {sock_path} (Unix) and :8080 (TCP health)");
+
+    loop {
+        let (stream, _) = unix_listener.accept().await.expect("unix accept failed");
+        let io = TokioIo::new(stream);
+        let app = app.clone();
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                app.clone().oneshot(req.map(Body::new))
+            });
+            http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(io, svc)
+                .await
+                .ok();
+        });
+    }
 }

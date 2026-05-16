@@ -5,6 +5,7 @@ services:
       - "9999:9999"
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets
     depends_on:
       api-1:
         condition: service_healthy
@@ -20,6 +21,9 @@ services:
     build: .
     environment:
       VPTREE_PATH: /data/vptree.bin
+      SOCKET_PATH: /sockets/api1.sock
+    volumes:
+      - sockets:/sockets
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ready || exit 1"]
       interval: 5s
@@ -36,6 +40,9 @@ services:
     build: .
     environment:
       VPTREE_PATH: /data/vptree.bin
+      SOCKET_PATH: /sockets/api2.sock
+    volumes:
+      - sockets:/sockets
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ready || exit 1"]
       interval: 5s
@@ -47,3 +54,6 @@ services:
         limits:
           cpus: "0.45"
           memory: "170MB"
+
+volumes:
+  sockets:
