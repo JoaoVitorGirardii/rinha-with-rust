@@ -37,7 +37,7 @@ struct PartitionHeader {
 #[repr(C)]
 struct Node {
     vector: [i16; 16],  // 14 features + 2 zeros (AVX2 alignment)
-    radius_sq: i32,     // squared median distance (i16 scale)
+    radius_sq: i32,
     left: u32,
     right: u32,
     label: u8,
@@ -49,61 +49,37 @@ struct Node {
 #[inline(always)]
 fn quantize(v: f32) -> i16 {
     let s = (v * SCALE).round();
-    if s >= 32767.0 {
-        32767
-    } else if s <= -32768.0 {
-        -32768
-    } else {
-        s as i16
-    }
+    if s >= 32767.0 { 32767 } else if s <= -32768.0 { -32768 } else { s as i16 }
 }
 
 fn quantize_vec(v: &[f32; 14]) -> [i16; 16] {
     let mut out = [0i16; 16];
-    for i in 0..14 {
-        out[i] = quantize(v[i]);
-    }
+    for i in 0..14 { out[i] = quantize(v[i]); }
     out
 }
 
 // ─── Partition key (8 bits) ───────────────────────────────────────────────────
-//
-// bit 0: has last_transaction (v[5] >= 0, since -1 means absent)
-// bit 1: is_online            (v[9]  > 0.5)
-// bit 2: card_present         (v[10] > 0.5)
-// bit 3: unknown_merchant     (v[11] > 0.5)
-// bits 4-5: mcc bucket (4 levels)
-// bit 6: high_value           (v[2]  > 0.5  ≡ amount/avg > 5)
-// bit 7: frequent_tx          (v[8]  > 0.5  ≡ tx_count_24h > 10)
 
 fn compute_partition_key(v: &[f32; 14]) -> u8 {
     let mut k: u8 = 0;
-    if v[5] >= 0.0 { k |= 1 << 0; }
-    if v[9]  > 0.5 { k |= 1 << 1; }
-    if v[10] > 0.5 { k |= 1 << 2; }
-    if v[11] > 0.5 { k |= 1 << 3; }
-
+    if v[5] >= 0.0  { k |= 1 << 0; }
+    if v[9]  > 0.5  { k |= 1 << 1; }
+    if v[10] > 0.5  { k |= 1 << 2; }
+    if v[11] > 0.5  { k |= 1 << 3; }
     let mcc = v[12];
-    let bucket: u8 = if mcc <= 0.2 { 0 }
-                     else if mcc <= 0.5 { 1 }
-                     else if mcc <= 0.8 { 2 }
-                     else { 3 };
+    let bucket: u8 = if mcc <= 0.2 { 0 } else if mcc <= 0.5 { 1 } else if mcc <= 0.8 { 2 } else { 3 };
     k |= bucket << 4;
-
     if v[2] > 0.5 { k |= 1 << 6; }
     if v[8] > 0.5 { k |= 1 << 7; }
     k
 }
 
-// ─── Distance (i32, since acumulação cabe — pior caso 2e9 < i32::MAX) ─────────
+// ─── Distance ─────────────────────────────────────────────────────────────────
 
 #[inline(always)]
 fn dist_sq_i16(a: &[i16; 16], b: &[i16; 16]) -> i32 {
     let mut sum: i32 = 0;
-    for i in 0..14 {
-        let d = a[i] as i32 - b[i] as i32;
-        sum += d * d;
-    }
+    for i in 0..14 { let d = a[i] as i32 - b[i] as i32; sum += d * d; }
     sum
 }
 
@@ -113,11 +89,7 @@ fn build_vptree(points: &mut Vec<([i16; 16], u8)>) -> Vec<Node> {
     let n = points.len();
     let mut nodes: Vec<Node> = Vec::with_capacity(n);
 
-    enum Patch {
-        Left(usize),
-        Right(usize),
-        Root,
-    }
+    enum Patch { Left(usize), Right(usize), Root }
     let mut stack: Vec<(usize, usize, Patch)> = vec![(0, n, Patch::Root)];
     let mut root_idx: u32 = 0;
 
@@ -125,14 +97,13 @@ fn build_vptree(points: &mut Vec<([i16; 16], u8)>) -> Vec<Node> {
         let len = end - start;
         if len == 0 {
             match patch {
-                Patch::Left(p) => nodes[p].left = NULL,
+                Patch::Left(p)  => nodes[p].left  = NULL,
                 Patch::Right(p) => nodes[p].right = NULL,
                 Patch::Root => {}
             }
             continue;
         }
 
-        // vantage point: sample up to 15 candidates, pick highest avg dispersion
         let sample_size = 15.min(len);
         let step = if len > sample_size { len / sample_size } else { 1 };
         let vp_offset = {
@@ -144,18 +115,10 @@ fn build_vptree(points: &mut Vec<([i16; 16], u8)>) -> Vec<Node> {
                 let mut count: i64 = 0;
                 for s2 in 0..sample_size {
                     let idx2 = start + (s2 * step).min(len - 1);
-                    if idx != idx2 {
-                        disp += dist_sq_i16(&points[idx].0, &points[idx2].0) as i64;
-                        count += 1;
-                    }
+                    if idx != idx2 { disp += dist_sq_i16(&points[idx].0, &points[idx2].0) as i64; count += 1; }
                 }
-                if count > 0 {
-                    disp /= count;
-                }
-                if disp > best_disp {
-                    best_disp = disp;
-                    best_offset = idx - start;
-                }
+                if count > 0 { disp /= count; }
+                if disp > best_disp { best_disp = disp; best_offset = idx - start; }
             }
             best_offset
         };
@@ -180,78 +143,46 @@ fn build_vptree(points: &mut Vec<([i16; 16], u8)>) -> Vec<Node> {
         let mut left_indices: Vec<usize> = Vec::new();
         let mut right_indices: Vec<usize> = Vec::new();
         for i in 0..rest_len {
-            if dists2[i] <= radius_sq {
-                left_indices.push(i);
-            } else {
-                right_indices.push(i);
-            }
+            if dists2[i] <= radius_sq { left_indices.push(i); } else { right_indices.push(i); }
         }
         let tmp: Vec<([i16; 16], u8)> = rest.to_vec();
         let split = left_indices.len();
-        for (dst, &src) in left_indices.iter().enumerate() {
-            rest[dst] = tmp[src];
-        }
-        for (dst, &src) in right_indices.iter().enumerate() {
-            rest[split + dst] = tmp[src];
-        }
+        for (dst, &src) in left_indices.iter().enumerate() { rest[dst] = tmp[src]; }
+        for (dst, &src) in right_indices.iter().enumerate() { rest[split + dst] = tmp[src]; }
 
         let node_idx = nodes.len();
-        nodes.push(Node {
-            vector: vp,
-            radius_sq,
-            left: NULL,
-            right: NULL,
-            label,
-            _pad: [0; 3],
-        });
+        nodes.push(Node { vector: vp, radius_sq, left: NULL, right: NULL, label, _pad: [0; 3] });
 
         match patch {
-            Patch::Left(p) => nodes[p].left = node_idx as u32,
+            Patch::Left(p)  => nodes[p].left  = node_idx as u32,
             Patch::Right(p) => nodes[p].right = node_idx as u32,
-            Patch::Root => root_idx = node_idx as u32,
+            Patch::Root     => root_idx = node_idx as u32,
         }
 
-        let left_end = start + 1 + split;
-        let right_end = end;
+        let left_end   = start + 1 + split;
+        let right_end  = end;
         let right_start = left_end;
-
-        if right_start < right_end {
-            stack.push((right_start, right_end, Patch::Right(node_idx)));
-        }
-        if start + 1 < left_end {
-            stack.push((start + 1, left_end, Patch::Left(node_idx)));
-        }
+        if right_start < right_end { stack.push((right_start, right_end, Patch::Right(node_idx))); }
+        if start + 1 < left_end   { stack.push((start + 1, left_end,   Patch::Left(node_idx)));  }
     }
 
-    // BFS reorder
+    // BFS reorder for cache locality
     let mut bfs: Vec<Node> = Vec::with_capacity(nodes.len());
     let mut old_to_new: Vec<u32> = vec![NULL; nodes.len()];
     let mut queue: VecDeque<u32> = VecDeque::new();
     queue.push_back(root_idx);
-
     while let Some(old_idx) = queue.pop_front() {
         let new_idx = bfs.len() as u32;
         old_to_new[old_idx as usize] = new_idx;
         bfs.push(nodes[old_idx as usize]);
-
         let node = &nodes[old_idx as usize];
-        if node.left != NULL {
-            queue.push_back(node.left);
-        }
-        if node.right != NULL {
-            queue.push_back(node.right);
-        }
+        if node.left  != NULL { queue.push_back(node.left);  }
+        if node.right != NULL { queue.push_back(node.right); }
     }
-
     for node in &mut bfs {
-        if node.left != NULL {
-            node.left = old_to_new[node.left as usize];
-        }
-        if node.right != NULL {
-            node.right = old_to_new[node.right as usize];
-        }
+        if node.left  != NULL { node.left  = old_to_new[node.left  as usize]; }
+        if node.right != NULL { node.right = old_to_new[node.right as usize]; }
     }
-
     bfs
 }
 
@@ -266,11 +197,7 @@ fn compute_bbox(points: &[([i16; 16], u8)]) -> ([i16; 16], [i16; 16]) {
             if v[i] > max[i] { max[i] = v[i]; }
         }
     }
-    // padding lanes stay at 0 (we never query non-zero there)
-    for i in 14..16 {
-        min[i] = 0;
-        max[i] = 0;
-    }
+    for i in 14..16 { min[i] = 0; max[i] = 0; }
     (min, max)
 }
 
@@ -293,7 +220,6 @@ fn main() {
 
     eprintln!("Loaded {} references, partitioning...", arr.len());
 
-    // Group references by partition key
     let mut groups: Vec<Vec<([i16; 16], u8)>> = (0..256).map(|_| Vec::new()).collect();
 
     for item in arr.iter() {
@@ -303,60 +229,41 @@ fn main() {
             if i >= 14 { break; }
             v[i] = x.as_f64().unwrap_or(0.0) as f32;
         }
-        let label_str = item["label"].as_str().unwrap_or("legit");
-        let label: u8 = if label_str == "fraud" { 1 } else { 0 };
-
+        let label: u8 = if item["label"].as_str().unwrap_or("legit") == "fraud" { 1 } else { 0 };
         let key = compute_partition_key(&v) as usize;
-        let qv = quantize_vec(&v);
-        groups[key].push((qv, label));
+        groups[key].push((quantize_vec(&v), label));
     }
 
     let n_non_empty = groups.iter().filter(|g| !g.is_empty()).count();
     eprintln!("{} non-empty partitions out of 256.", n_non_empty);
 
-    // Print distribution (helps debug skew)
     let mut sizes: Vec<(usize, usize)> = groups.iter().enumerate()
         .filter(|(_, g)| !g.is_empty())
         .map(|(i, g)| (i, g.len()))
         .collect();
     sizes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    eprintln!("Top partitions: ");
-    for (k, n) in sizes.iter().take(10) {
-        eprintln!("  key={k:3} count={n}");
-    }
-    eprintln!("Smallest: ");
-    for (k, n) in sizes.iter().rev().take(5) {
-        eprintln!("  key={k:3} count={n}");
-    }
+    eprintln!("Top partitions:");
+    for (k, n) in sizes.iter().take(10) { eprintln!("  key={k:3} count={n}"); }
 
-    // Build VP-tree per partition, accumulate into global node list
     let mut all_nodes: Vec<Node> = Vec::new();
     let mut partitions: Vec<PartitionHeader> = Vec::new();
 
     for (key, group) in groups.iter_mut().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
+        if group.is_empty() { continue; }
         let (min, max) = compute_bbox(group);
         let local_nodes = build_vptree(group);
         let base = all_nodes.len() as u32;
         let count = local_nodes.len() as u32;
 
-        // Rewrite child offsets to global indices
         for n in &local_nodes {
             let mut g = *n;
-            if g.left != NULL { g.left += base; }
+            if g.left  != NULL { g.left  += base; }
             if g.right != NULL { g.right += base; }
             all_nodes.push(g);
         }
 
         partitions.push(PartitionHeader {
-            key: key as u32,
-            root: base, // root is at local index 0 after BFS reorder
-            count,
-            _pad: 0,
-            min,
-            max,
+            key: key as u32, root: base, count, _pad: 0, min, max,
         });
     }
 
@@ -364,11 +271,7 @@ fn main() {
     let n_nodes = all_nodes.len() as u32;
     eprintln!("Built {} partitions, {} total nodes.", n_partitions, n_nodes);
 
-    let header = Header {
-        magic: *b"RNSPSCT1",
-        n_partitions,
-        n_nodes,
-    };
+    let header = Header { magic: *b"RNSPSCT1", n_partitions, n_nodes };
 
     let mut out = File::create(&out_path).expect("cannot create output file");
     out.write_all(bytemuck::bytes_of(&header)).expect("write header");
