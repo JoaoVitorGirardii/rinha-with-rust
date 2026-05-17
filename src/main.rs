@@ -17,24 +17,45 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-// ─── VP-Tree node (must match preprocess.rs exactly) ─────────────────────────
+// ─── Binary format (must match preprocess.rs) ────────────────────────────────
+
+const SCALE: f32 = 10000.0;
+const NULL: u32 = u32::MAX;
+const K: usize = 5;
+const MAX_PARTITIONS: usize = 256;
+
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct Header {
+    magic: [u8; 8],
+    n_partitions: u32,
+    n_nodes: u32,
+}
+
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct PartitionHeader {
+    key: u32,
+    root: u32,
+    count: u32,
+    _pad: u32,
+    min: [i16; 16],
+    max: [i16; 16],
+}
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 struct Node {
-    vector: [f32; 14],
-    radius: f32,
+    vector: [i16; 16],
+    radius_sq: i32,
     left: u32,
     right: u32,
     label: u8,
     _pad: [u8; 3],
 }
 
-const NULL: u32 = u32::MAX;
-const K: usize = 5;
+// ─── Fixed responses ──────────────────────────────────────────────────────────
 
-// fraud_count ∈ {0,1,2,3,4,5} → score ∈ {0.0,0.2,0.4,0.6,0.8,1.0}
-// approved = score < 0.6 → fraud_count < 3
 static RESPONSES: [&[u8]; 6] = [
     br#"{"approved":true,"fraud_score":0.0}"#,
     br#"{"approved":true,"fraud_score":0.2}"#,
@@ -44,7 +65,7 @@ static RESPONSES: [&[u8]; 6] = [
     br#"{"approved":false,"fraud_score":1.0}"#,
 ];
 
-// ─── Normalization constants (baked in — from normalization.json) ─────────────
+// ─── Normalization constants ──────────────────────────────────────────────────
 
 const MAX_AMOUNT: f32 = 10_000.0;
 const MAX_INSTALLMENTS: f32 = 12.0;
@@ -54,7 +75,6 @@ const MAX_KM: f32 = 1_000.0;
 const MAX_TX_COUNT_24H: f32 = 20.0;
 const MAX_MERCHANT_AVG_AMOUNT: f32 = 10_000.0;
 
-// MCC risk table (baked in — from mcc_risk.json)
 fn mcc_risk(mcc: &str) -> f32 {
     match mcc {
         "5411" => 0.15,
@@ -186,7 +206,6 @@ fn parse_u32(bytes: &[u8]) -> u32 {
     v
 }
 
-// Returns 0=Mon..6=Sun (ISO weekday - 1)
 fn day_of_week(year: u32, month: u32, day: u32) -> u32 {
     let y = if month < 3 { year - 1 } else { year };
     let m = month as usize;
@@ -228,77 +247,227 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
     era * 146097 + doe - 719468
 }
 
-// ─── KNN search on VP-Tree ────────────────────────────────────────────────────
+// ─── Partition key (must match preprocess.rs) ─────────────────────────────────
+
+fn compute_partition_key(v: &[f32; 14]) -> u8 {
+    let mut k: u8 = 0;
+    if v[5] >= 0.0 { k |= 1 << 0; }
+    if v[9]  > 0.5 { k |= 1 << 1; }
+    if v[10] > 0.5 { k |= 1 << 2; }
+    if v[11] > 0.5 { k |= 1 << 3; }
+
+    let mcc = v[12];
+    let bucket: u8 = if mcc <= 0.2 { 0 }
+                     else if mcc <= 0.5 { 1 }
+                     else if mcc <= 0.8 { 2 }
+                     else { 3 };
+    k |= bucket << 4;
+
+    if v[2] > 0.5 { k |= 1 << 6; }
+    if v[8] > 0.5 { k |= 1 << 7; }
+    k
+}
+
+// ─── Quantization ─────────────────────────────────────────────────────────────
 
 #[inline(always)]
-fn dist_sq(a: &[f32; 14], b: &[f32; 14]) -> f32 {
-    let mut sum = 0.0f32;
-    for i in 0..14 {
-        let d = a[i] - b[i];
-        sum += d * d;
+fn quantize(v: f32) -> i16 {
+    let s = (v * SCALE).round();
+    if s >= 32767.0 {
+        32767
+    } else if s <= -32768.0 {
+        -32768
+    } else {
+        s as i16
     }
-    sum
 }
+
+fn quantize_vec(v: &[f32; 14]) -> [i16; 16] {
+    let mut out = [0i16; 16];
+    for i in 0..14 {
+        out[i] = quantize(v[i]);
+    }
+    out
+}
+
+// ─── Distance (SSE2 i16 via _mm_madd_epi16, 128-bit avoids AVX-256 downclock) ─
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn dist_sq_i16_sse2(a: &[i16; 16], b: &[i16; 16]) -> i32 {
+    use std::arch::x86_64::*;
+    // Process two 128-bit halves (8 i16 each = 16 i16 total)
+    let a_lo = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+    let b_lo = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+    let a_hi = _mm_loadu_si128(a.as_ptr().add(8) as *const __m128i);
+    let b_hi = _mm_loadu_si128(b.as_ptr().add(8) as *const __m128i);
+
+    let d_lo = _mm_sub_epi16(a_lo, b_lo);
+    let d_hi = _mm_sub_epi16(a_hi, b_hi);
+
+    let m_lo = _mm_madd_epi16(d_lo, d_lo); // 4 i32
+    let m_hi = _mm_madd_epi16(d_hi, d_hi);
+
+    let sum = _mm_add_epi32(m_lo, m_hi);
+    let s2 = _mm_add_epi32(sum, _mm_shuffle_epi32::<0b_01_00_11_10>(sum));
+    let s1 = _mm_add_epi32(s2, _mm_shuffle_epi32::<0b_00_00_00_01>(s2));
+    _mm_cvtsi128_si32(s1)
+}
+
+#[inline(always)]
+fn dist_sq_i16(a: &[i16; 16], b: &[i16; 16]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { dist_sq_i16_sse2(a, b) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut sum: i32 = 0;
+        for i in 0..14 {
+            let d = a[i] as i32 - b[i] as i32;
+            sum += d * d;
+        }
+        sum
+    }
+}
+
+// ─── Lower-bound distance² to bounding box ────────────────────────────────────
+
+#[inline(always)]
+fn lb_box_sq(q: &[i16; 16], min: &[i16; 16], max: &[i16; 16]) -> i32 {
+    let mut sum: i64 = 0;
+    for i in 0..14 {
+        let qi = q[i] as i32;
+        let mi = min[i] as i32;
+        let mx = max[i] as i32;
+        let d = if qi < mi {
+            mi - qi
+        } else if qi > mx {
+            qi - mx
+        } else {
+            0
+        };
+        sum += (d * d) as i64;
+    }
+    if sum > i32::MAX as i64 { i32::MAX } else { sum as i32 }
+}
+
+// ─── KNN search ───────────────────────────────────────────────────────────────
 
 struct AppState {
     #[allow(dead_code)]
-    nodes: Mmap,
-    node_ptr: usize,
-    node_len: usize,
+    mmap: Mmap,
+    partitions_ptr: usize,
+    partitions_len: usize,
+    nodes_ptr: usize,
+    nodes_len: usize,
+    // key → index into partitions[], or u16::MAX if absent
+    key_to_idx: [u16; 256],
 }
 
 unsafe impl Send for AppState {}
 unsafe impl Sync for AppState {}
 
 impl AppState {
-    fn new(nodes: Mmap) -> Self {
-        let slice: &[Node] = bytemuck::cast_slice(&nodes[..]);
-        let node_ptr = slice.as_ptr() as usize;
-        let node_len = slice.len();
-        Self { nodes, node_ptr, node_len }
+    fn new(mmap: Mmap) -> Self {
+        assert!(mmap.len() >= std::mem::size_of::<Header>(), "file too small");
+        let header: &Header = bytemuck::from_bytes(&mmap[..std::mem::size_of::<Header>()]);
+        assert_eq!(&header.magic, b"RNSPSCT1", "bad magic");
+
+        let n_partitions = header.n_partitions as usize;
+        let n_nodes = header.n_nodes as usize;
+
+        let part_offset = std::mem::size_of::<Header>();
+        let part_size = n_partitions * std::mem::size_of::<PartitionHeader>();
+        let nodes_offset = part_offset + part_size;
+        let nodes_size = n_nodes * std::mem::size_of::<Node>();
+        assert_eq!(mmap.len(), nodes_offset + nodes_size, "file size mismatch");
+
+        let partitions: &[PartitionHeader] =
+            bytemuck::cast_slice(&mmap[part_offset..part_offset + part_size]);
+        let nodes: &[Node] =
+            bytemuck::cast_slice(&mmap[nodes_offset..nodes_offset + nodes_size]);
+
+        let partitions_ptr = partitions.as_ptr() as usize;
+        let partitions_len = partitions.len();
+        let nodes_ptr = nodes.as_ptr() as usize;
+        let nodes_len = nodes.len();
+
+        // Build O(1) lookup table
+        let mut key_to_idx = [u16::MAX; 256];
+        for (i, p) in partitions.iter().enumerate() {
+            key_to_idx[p.key as usize & 0xff] = i as u16;
+        }
+
+        eprintln!(
+            "Loaded: {} partitions, {} nodes ({:.1} MB)",
+            n_partitions,
+            n_nodes,
+            mmap.len() as f64 / 1_000_000.0,
+        );
+
+        Self { mmap, partitions_ptr, partitions_len, nodes_ptr, nodes_len, key_to_idx }
     }
 
-    fn nodes_slice(&self) -> &[Node] {
-        unsafe { std::slice::from_raw_parts(self.node_ptr as *const Node, self.node_len) }
+    #[inline(always)]
+    fn partitions(&self) -> &[PartitionHeader] {
+        unsafe { std::slice::from_raw_parts(self.partitions_ptr as *const PartitionHeader, self.partitions_len) }
+    }
+
+    #[inline(always)]
+    fn nodes(&self) -> &[Node] {
+        unsafe { std::slice::from_raw_parts(self.nodes_ptr as *const Node, self.nodes_len) }
     }
 }
 
 thread_local! {
-    static STACK_BUF: RefCell<Vec<u32>> = RefCell::new(Vec::with_capacity(128));
+    static STACK_BUF: RefCell<Vec<u32>> = RefCell::new(Vec::with_capacity(256));
 }
 
-fn knn_search(nodes: &[Node], query: &[f32; 14]) -> usize {
-    let mut best = [(f32::MAX, 0u8); K];
-    let mut worst_best = f32::MAX;
-
+fn search_tree(
+    nodes: &[Node],
+    root: u32,
+    query: &[i16; 16],
+    best: &mut [(i32, u8); K],
+    worst_best: &mut i32,
+) {
     STACK_BUF.with(|buf| {
         let mut stack = buf.borrow_mut();
         stack.clear();
-        stack.push(0);
+        stack.push(root);
 
         while let Some(idx) = stack.pop() {
             if idx == NULL { continue; }
             let node = &nodes[idx as usize];
-            let d = dist_sq(query, &node.vector);
+            let d = dist_sq_i16(query, &node.vector);
 
-            if d < worst_best {
+            if d < *worst_best {
                 let mut max_pos = 0;
                 for i in 1..K {
                     if best[i].0 > best[max_pos].0 { max_pos = i; }
                 }
                 best[max_pos] = (d, node.label);
-                worst_best = best.iter().map(|x| x.0).fold(f32::MIN, f32::max);
+                let mut w = best[0].0;
+                for i in 1..K {
+                    if best[i].0 > w { w = best[i].0; }
+                }
+                *worst_best = w;
             }
 
-            let sqrt_d = d.sqrt();
-            let r = node.radius.sqrt(); // radius stored as dist_sq → take sqrt for euclidean
-            let dl = (sqrt_d - r).max(0.0);
-            let dr = (r - sqrt_d).max(0.0);
-            let can_left  = node.left  != NULL && dl * dl < worst_best;
-            let can_right = node.right != NULL && dr * dr < worst_best;
+            // VP-tree pruning via triangle inequality. Compare squared dists
+            // (cheaper than sqrt on worst_best — matches the original f32 logic).
+            let d_f = (d as f32).sqrt();
+            let r_f = (node.radius_sq as f32).sqrt();
+            let dl = (d_f - r_f).max(0.0);
+            let dr = (r_f - d_f).max(0.0);
+            let dl_sq = (dl * dl) as i32;
+            let dr_sq = (dr * dr) as i32;
+            let can_left  = node.left  != NULL && dl_sq < *worst_best;
+            let can_right = node.right != NULL && dr_sq < *worst_best;
 
             if can_left && can_right {
-                if sqrt_d <= r {
+                if d <= node.radius_sq {
                     stack.push(node.right);
                     stack.push(node.left);
                 } else {
@@ -311,8 +480,44 @@ fn knn_search(nodes: &[Node], query: &[f32; 14]) -> usize {
             }
         }
     });
+}
 
-    best.iter().map(|&(_, label)| label as usize).sum()
+fn knn_search(state: &AppState, query: &[i16; 16], key: u8) -> usize {
+    let partitions = state.partitions();
+    let nodes = state.nodes();
+
+    let mut best = [(i32::MAX, 0u8); K];
+    let mut worst_best = i32::MAX;
+
+    // 1) Primary partition first (key-first) — O(1) lookup
+    let primary_idx_raw = state.key_to_idx[key as usize];
+    let primary_idx: Option<usize> = if primary_idx_raw == u16::MAX {
+        None
+    } else {
+        Some(primary_idx_raw as usize)
+    };
+
+    if let Some(idx) = primary_idx {
+        search_tree(nodes, partitions[idx].root, query, &mut best, &mut worst_best);
+    }
+
+    // 2) Other partitions, ordered by lb²
+    let mut others: [(i32, u32); MAX_PARTITIONS] = [(i32::MAX, NULL); MAX_PARTITIONS];
+    let mut count = 0;
+    for (i, p) in partitions.iter().enumerate() {
+        if Some(i) == primary_idx { continue; }
+        others[count] = (lb_box_sq(query, &p.min, &p.max), p.root);
+        count += 1;
+    }
+    others[..count].sort_unstable_by_key(|(lb, _)| *lb);
+
+    for &(lb, root) in &others[..count] {
+        if lb >= worst_best { break; }
+        search_tree(nodes, root, query, &mut best, &mut worst_best);
+    }
+
+    let sum: usize = best.iter().map(|(_, l)| *l as usize).sum();
+    sum.min(5)
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -339,12 +544,14 @@ async fn fraud_score_handler(
         Err(_) => return json_response(RESPONSES[0]),
     };
 
-    if state.node_len == 0 {
+    if state.nodes_len == 0 {
         return json_response(RESPONSES[0]);
     }
 
-    let query = vectorize(&req).map(|x| (x * 10000.0).round() / 10000.0);
-    let fraud_count = knn_search(state.nodes_slice(), &query);
+    let v = vectorize(&req);
+    let key = compute_partition_key(&v);
+    let query = quantize_vec(&v);
+    let fraud_count = knn_search(&state, &query, key);
     json_response(RESPONSES[fraud_count])
 }
 
@@ -374,9 +581,6 @@ async fn main() {
     eprintln!("Warming up mmap ({} MB)...", mmap.len() / 1_000_000);
     warmup_mmap(&mmap);
 
-    let node_count = mmap.len() / std::mem::size_of::<Node>();
-    eprintln!("VP-Tree loaded: {node_count} nodes. Ready.");
-
     let state = Arc::new(AppState::new(mmap));
 
     let app = Router::new()
@@ -384,7 +588,7 @@ async fn main() {
         .route("/fraud-score", post(fraud_score_handler))
         .with_state(state);
 
-    // TCP :8080 — apenas para o healthcheck do docker-compose
+    // TCP :8080 — apenas para healthcheck do docker-compose
     let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await
         .expect("tcp bind failed");
@@ -393,12 +597,10 @@ async fn main() {
         axum::serve(tcp_listener, tcp_app).await.expect("tcp serve failed");
     });
 
-    // Unix socket — tráfego real do HAProxy (sem overhead de bridge TCP)
-    let sock_path = std::env::var("SOCKET_PATH")
-        .unwrap_or_else(|_| "/tmp/api.sock".to_string());
+    // Unix socket — tráfego real do HAProxy
+    let sock_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
     let _ = std::fs::remove_file(&sock_path);
-    let unix_listener = tokio::net::UnixListener::bind(&sock_path)
-        .expect("unix bind failed");
+    let unix_listener = tokio::net::UnixListener::bind(&sock_path).expect("unix bind failed");
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o777))
         .expect("set socket permissions failed");
     eprintln!("Listening on {sock_path} (Unix) and :8080 (TCP health)");

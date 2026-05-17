@@ -7,3 +7,4 @@ target
 *.pdb
 **/mutants.out*/
 rustc-ice-*.txt
+vptree.bin

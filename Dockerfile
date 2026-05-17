@@ -5,6 +5,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 
+# target-cpu=haswell ativa AVX2/BMI/FMA/POPCNT.
+# Mac Mini 2014 (Haswell) e o host de dev (Comet Lake) suportam.
+ENV RUSTFLAGS="-C target-cpu=haswell"
 RUN cargo build --release --bin preprocess --bin api
 
 # ─── Stage 2: Preprocess — build VP-Tree ─────────────────────────────────────
