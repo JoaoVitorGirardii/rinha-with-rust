@@ -18,7 +18,7 @@ services:
           memory: "10MB"
 
   api-1:
-    build: .
+    image: joaovitorgirardiii/rinha-with-rust:latest
     environment:
       VPTREE_PATH: /data/vptree.bin
       SOCKET_PATH: /sockets/api1.sock
@@ -37,7 +37,7 @@ services:
           memory: "170MB"
 
   api-2:
-    build: .
+    image: joaovitorgirardiii/rinha-with-rust:latest
     environment:
       VPTREE_PATH: /data/vptree.bin
       SOCKET_PATH: /sockets/api2.sock
